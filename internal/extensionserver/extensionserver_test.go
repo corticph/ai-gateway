@@ -246,7 +246,7 @@ func Test_maybeModifyCluster(t *testing.T) {
 										},
 										ProcessingMode: &extprocv3.ProcessingMode{
 											RequestHeaderMode:  extprocv3.ProcessingMode_SEND,
-											RequestBodyMode:    extprocv3.ProcessingMode_NONE,
+											RequestBodyMode:    extprocv3.ProcessingMode_BUFFERED,
 											ResponseHeaderMode: extprocv3.ProcessingMode_SKIP,
 											ResponseBodyMode:   extprocv3.ProcessingMode_NONE,
 										},
@@ -380,7 +380,7 @@ func Test_maybeModifyCluster(t *testing.T) {
 										},
 										ProcessingMode: &extprocv3.ProcessingMode{
 											RequestHeaderMode:  extprocv3.ProcessingMode_SEND,
-											RequestBodyMode:    extprocv3.ProcessingMode_NONE,
+											RequestBodyMode:    extprocv3.ProcessingMode_BUFFERED,
 											ResponseHeaderMode: extprocv3.ProcessingMode_SKIP,
 											ResponseBodyMode:   extprocv3.ProcessingMode_NONE,
 										},

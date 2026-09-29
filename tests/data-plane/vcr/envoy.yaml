@@ -167,7 +167,7 @@ static_resources:
                   - xds.upstream_host_metadata.filter_metadata['aigateway.envoy.io']['per_route_rule_backend_name']
                 processing_mode:
                   request_header_mode: "SEND" # Transform request format and inject auth headers
-                  request_body_mode: "NONE" # Body already processed by router filter
+                  request_body_mode: "BUFFERED" # Body mutation applied in ProcessRequestBody on current body
                   response_header_mode: "SKIP" # Router filter handles all response processing
                   response_body_mode: "NONE" # Router filter handles all response processing
                 grpc_service:
@@ -218,7 +218,7 @@ static_resources:
                   - xds.upstream_host_metadata.filter_metadata['aigateway.envoy.io']['per_route_rule_backend_name']
                 processing_mode:
                   request_header_mode: "SEND" # Transform request format and inject auth headers
-                  request_body_mode: "NONE" # Body already processed by router filter
+                  request_body_mode: "BUFFERED" # Body mutation applied in ProcessRequestBody on current body
                   response_header_mode: "SKIP" # Router filter handles all response processing
                   response_body_mode: "NONE" # Router filter handles all response processing
                 grpc_service:
@@ -269,7 +269,7 @@ static_resources:
                   - xds.upstream_host_metadata.filter_metadata['aigateway.envoy.io']['per_route_rule_backend_name']
                 processing_mode:
                   request_header_mode: "SEND" # Transform request format and inject auth headers
-                  request_body_mode: "NONE" # Body already processed by router filter
+                  request_body_mode: "BUFFERED" # Body mutation applied in ProcessRequestBody on current body
                   response_header_mode: "SKIP" # Router filter handles all response processing
                   response_body_mode: "NONE" # Router filter handles all response processing
                 grpc_service:
@@ -320,7 +320,7 @@ static_resources:
                   - xds.upstream_host_metadata.filter_metadata['aigateway.envoy.io']['per_route_rule_backend_name']
                 processing_mode:
                   request_header_mode: "SEND" # Transform request format and inject auth headers
-                  request_body_mode: "NONE" # Body already processed by router filter
+                  request_body_mode: "BUFFERED" # Body mutation applied in ProcessRequestBody on current body
                   response_header_mode: "SKIP" # Router filter handles all response processing
                   response_body_mode: "NONE" # Router filter handles all response processing
                 grpc_service:
@@ -371,7 +371,7 @@ static_resources:
                   - xds.upstream_host_metadata.filter_metadata['aigateway.envoy.io']['per_route_rule_backend_name']
                 processing_mode:
                   request_header_mode: "SEND" # Transform request format and inject auth headers
-                  request_body_mode: "NONE" # Body already processed by router filter
+                  request_body_mode: "BUFFERED" # Body mutation applied in ProcessRequestBody on current body
                   response_header_mode: "SKIP" # Router filter handles all response processing
                   response_body_mode: "NONE" # Router filter handles all response processing
                 grpc_service:
@@ -422,7 +422,7 @@ static_resources:
                   - xds.upstream_host_metadata.filter_metadata['aigateway.envoy.io']['per_route_rule_backend_name']
                 processing_mode:
                   request_header_mode: "SEND" # Transform request format and inject auth headers
-                  request_body_mode: "NONE" # Body already processed by router filter
+                  request_body_mode: "BUFFERED" # Body mutation applied in ProcessRequestBody on current body
                   response_header_mode: "SKIP" # Router filter handles all response processing
                   response_body_mode: "NONE" # Router filter handles all response processing
                 grpc_service:

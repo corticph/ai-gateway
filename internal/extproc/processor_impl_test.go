@@ -754,17 +754,26 @@ func Test_chatCompletionProcessorUpstreamFilter_ProcessRequestHeaders(t *testing
 					translator:     mt,
 					handler:        &mockBackendAuthHandler{},
 				}
-				resp, err := p.ProcessRequestHeaders(t.Context(), nil)
-				require.NoError(t, err)
-				require.Equal(t, mt, p.translator)
-				require.NotNil(t, resp)
-				commonRes := resp.Response.(*extprocv3.ProcessingResponse_RequestHeaders).RequestHeaders.Response
-				require.Equal(t, string(bodyMut), string(commonRes.BodyMutation.GetBody()))
-				require.Len(t, commonRes.HeaderMutation.SetHeaders, 2)
-				require.Equal(t, "a", commonRes.HeaderMutation.SetHeaders[0].Header.Key)
-				require.Equal(t, []byte("b"), commonRes.HeaderMutation.SetHeaders[0].Header.RawValue)
-				require.Equal(t, "foo", commonRes.HeaderMutation.SetHeaders[1].Header.Key)
-				require.Equal(t, "mock-auth-handler", string(commonRes.HeaderMutation.SetHeaders[1].Header.RawValue))
+			resp, err := p.ProcessRequestHeaders(t.Context(), nil)
+			require.NoError(t, err)
+			require.Equal(t, mt, p.translator)
+			require.NotNil(t, resp)
+			commonRes := resp.Response.(*extprocv3.ProcessingResponse_RequestHeaders).RequestHeaders.Response
+			require.Equal(t, extprocv3.CommonResponse_CONTINUE, commonRes.Status)
+			require.Nil(t, commonRes.BodyMutation)
+			require.Len(t, commonRes.HeaderMutation.SetHeaders, 2)
+			require.Equal(t, "a", commonRes.HeaderMutation.SetHeaders[0].Header.Key)
+			require.Equal(t, []byte("b"), commonRes.HeaderMutation.SetHeaders[0].Header.RawValue)
+			require.Equal(t, "foo", commonRes.HeaderMutation.SetHeaders[1].Header.Key)
+			require.Equal(t, "mock-auth-handler", string(commonRes.HeaderMutation.SetHeaders[1].Header.RawValue))
+
+			// Body replacement happens in ProcessRequestBody.
+			bodyResp, err := p.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: someBody})
+			require.NoError(t, err)
+			require.NotNil(t, bodyResp)
+			bodyRes := bodyResp.Response.(*extprocv3.ProcessingResponse_RequestBody).RequestBody.Response
+			require.Equal(t, extprocv3.CommonResponse_CONTINUE, bodyRes.Status)
+			require.Equal(t, string(bodyMut), string(bodyRes.BodyMutation.GetBody()))
 
 				md := resp.DynamicMetadata
 				require.NotNil(t, md)
@@ -826,9 +835,16 @@ func Test_messagesProcessorUpstreamFilter_ProcessRequestHeaders_AWSAnthropicBeta
 	resp, err := p.ProcessRequestHeaders(t.Context(), nil)
 	require.NoError(t, err)
 	commonRes := resp.Response.(*extprocv3.ProcessingResponse_RequestHeaders).RequestHeaders.Response
+	require.Equal(t, extprocv3.CommonResponse_CONTINUE, commonRes.Status)
+
+	// Body replacement happens in ProcessRequestBody.
+	bodyResp, err := p.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: raw})
+	require.NoError(t, err)
+	bodyRes := bodyResp.Response.(*extprocv3.ProcessingResponse_RequestBody).RequestBody.Response
+	require.Equal(t, extprocv3.CommonResponse_CONTINUE, bodyRes.Status)
 
 	var translatedBody map[string]any
-	err = json.Unmarshal(commonRes.BodyMutation.GetBody(), &translatedBody)
+	err = json.Unmarshal(bodyRes.BodyMutation.GetBody(), &translatedBody)
 	require.NoError(t, err)
 	require.Equal(t, "bedrock-2023-05-31", translatedBody["anthropic_version"])
 	require.NotContains(t, translatedBody, "model")
@@ -914,7 +930,7 @@ func Test_chatCompletionProcessorUpstreamFilter_ProcessRequestHeaders_BodyReplac
 			"buildContentLengthDynamicMetadataOnRequest must not be called when the body is not replaced")
 	})
 
-	t.Run("translator body present -> CONTINUE_AND_REPLACE", func(t *testing.T) {
+	t.Run("translator body present -> CONTINUE_AND_REPLACE in ProcessRequestBody", func(t *testing.T) {
 		someBody := bodyFromModel(t, "some-model", false, nil)
 		headers := map[string]string{
 			":path":                               "/foo",
@@ -954,10 +970,124 @@ func Test_chatCompletionProcessorUpstreamFilter_ProcessRequestHeaders_BodyReplac
 		require.NotNil(t, resp)
 
 		commonRes := resp.Response.(*extprocv3.ProcessingResponse_RequestHeaders).RequestHeaders.Response
-		require.Equal(t, extprocv3.CommonResponse_CONTINUE_AND_REPLACE, commonRes.Status,
-			"existing CONTINUE_AND_REPLACE behavior must be preserved when the translator produced a body")
-		require.Equal(t, bodyMut, commonRes.BodyMutation.GetBody())
+		require.Equal(t, extprocv3.CommonResponse_CONTINUE, commonRes.Status,
+			"ProcessRequestHeaders returns CONTINUE — body replacement is deferred to ProcessRequestBody")
+		require.Nil(t, commonRes.BodyMutation)
+
+		// Body replacement happens in ProcessRequestBody, using the translator's body.
+		bodyResp, err := p.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: someBody})
+		require.NoError(t, err)
+		bodyRes := bodyResp.Response.(*extprocv3.ProcessingResponse_RequestBody).RequestBody.Response
+	require.Equal(t, extprocv3.CommonResponse_CONTINUE, bodyRes.Status,
+		"ProcessRequestBody must return CONTINUE with BodyMutation when the translator produced a body")
+		require.Equal(t, bodyMut, bodyRes.BodyMutation.GetBody())
 	})
+}
+
+// Test_chatCompletionProcessorUpstreamFilter_ProcessRequestHeaders_BodyMutationClobbersEarlierExtProc
+// reproduces PLA-7092: when bodyMutation is configured (e.g. reasoning_effort),
+// the upstream ext_proc applies it to originalRequestBodyRaw (captured before
+// any downstream ext_proc ran) and sends CONTINUE_AND_REPLACE, clobbering a
+// max_tokens → max_completion_tokens rename done by a prior ext_proc filter.
+//
+// This test simulates the full scenario:
+//   - Client sends max_tokens in the request body
+//   - A prior ext_proc (models-envoy-extension) renames max_tokens → max_completion_tokens
+//   - The AI Gateway's router ext_proc captured originalRequestBodyRaw with max_tokens (pre-rename)
+//   - The upstream ext_proc has a bodyMutator (reasoning_effort: "none")
+//   - The upstream ext_proc sends CONTINUE_AND_REPLACE with the stale body
+//
+// Before the fix: the upstream ext_proc used the stale originalRequestBodyRaw
+// (captured before prior ext_proc filters ran) when applying bodyMutation,
+// clobbering field renames done by earlier filters. After the fix:
+// ProcessRequestHeaders returns CONTINUE with headers only, and
+// ProcessRequestBody receives the current (post-prior-filter) body and
+// applies bodyMutator on it.
+func Test_chatCompletionProcessorUpstreamFilter_ProcessRequestHeaders_BodyMutationClobbersEarlierExtProc(t *testing.T) {
+	// The body the client originally sent — has max_tokens, no reasoning_effort.
+	originalBody := []byte(`{"model":"some-model","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}`)
+
+	// The body after a prior ext_proc renamed max_tokens → max_completion_tokens.
+	// This is what the upstream ext_proc sees as the "current" body in ProcessRequestBody.
+	renamedBody := []byte(`{"model":"some-model","max_completion_tokens":100,"messages":[{"role":"user","content":"hi"}]}`)
+
+	// The bodyMutation configured on the route: set reasoning_effort to "none".
+	bodyMutator := bodymutator.NewBodyMutator(&filterapi.HTTPBodyMutation{
+		Set: []filterapi.HTTPBodyField{
+			{Path: "reasoning_effort", Value: `"none"`},
+		},
+	}, originalBody)
+
+	var expBody openai.ChatCompletionRequest
+	require.NoError(t, json.Unmarshal(originalBody, &expBody))
+
+	headers := map[string]string{
+		":path":                               "/v1/chat/completions",
+		internalapi.ModelNameHeaderKeyDefault: "some-model",
+	}
+
+	// mockTranslator is a passthrough — no model override, no body output.
+	mt := &mockTranslator{
+		t:                           t,
+		expRequestBody:              &expBody,
+		retHeaderMutation:           []internalapi.Header{{":path", "/v1/chat/completions"}},
+		retBodyMutation:             nil,
+		expForceRequestBodyMutation: false,
+	}
+	mm := &mockMetrics{}
+	p := &chatCompletionProcessorUpstreamFilter{
+		parent: &chatCompletionProcessorRouterFilter{
+			config:                 &filterapi.RuntimeConfig{},
+			logger:                 slog.Default(),
+			originalRequestBodyRaw: originalBody, // stale — has max_tokens
+			originalRequestBody:    &expBody,
+			originalModel:           "some-model",
+			stream:                  false,
+			forceBodyMutation:       false,
+		},
+		requestHeaders: headers,
+		metrics:        mm,
+		translator:     mt,
+		handler:        &mockBackendAuthHandler{},
+		bodyMutator:    bodyMutator,
+	}
+
+	// Step 1: ProcessRequestHeaders should return CONTINUE with headers only —
+	// no BodyMutation. The body replacement is deferred to ProcessRequestBody.
+	resp, err := p.ProcessRequestHeaders(t.Context(), nil)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	hdrRes := resp.Response.(*extprocv3.ProcessingResponse_RequestHeaders).RequestHeaders.Response
+	require.Equal(t, extprocv3.CommonResponse_CONTINUE, hdrRes.Status,
+		"ProcessRequestHeaders should return CONTINUE — body replacement is deferred to ProcessRequestBody")
+	require.Nil(t, hdrRes.BodyMutation,
+		"ProcessRequestHeaders should not carry a BodyMutation")
+	require.NotNil(t, hdrRes.HeaderMutation,
+		"ProcessRequestHeaders should carry header mutations")
+
+	// Step 2: ProcessRequestBody receives the current (post-prior-filter) body
+	// and should apply bodyMutator on it, returning CONTINUE_AND_REPLACE.
+	bodyResp, err := p.ProcessRequestBody(t.Context(), &extprocv3.HttpBody{Body: renamedBody})
+	require.NoError(t, err)
+	require.NotNil(t, bodyResp)
+
+	bodyRes := bodyResp.Response.(*extprocv3.ProcessingResponse_RequestBody).RequestBody.Response
+	require.Equal(t, extprocv3.CommonResponse_CONTINUE, bodyRes.Status,
+		"ProcessRequestBody should return CONTINUE with BodyMutation when body mutation is needed")
+
+	bodyBytes := bodyRes.BodyMutation.GetBody()
+	require.NotNil(t, bodyBytes, "body mutation should be present when bodyMutator has mutations")
+
+	// The rename done by the prior ext_proc must be preserved.
+	require.Contains(t, string(bodyBytes), `"max_completion_tokens":100`,
+		"the field rename done by a prior ext_proc should be preserved")
+	require.NotContains(t, string(bodyBytes), `"max_tokens":100`,
+		"the stale field name should not appear in the body sent upstream")
+
+	// The bodyMutator's mutation should be applied on the current body.
+	require.Contains(t, string(bodyBytes), `"reasoning_effort":"none"`,
+		"bodyMutator should have set reasoning_effort on the body")
 }
 
 func Test_chatCompletionProcessorUpstreamFilter_MergeWithTokenLatencyMetadata(t *testing.T) {
@@ -1533,9 +1663,17 @@ func TestChatCompletionProcessorUpstreamFilter_ProcessRequestHeaders_WithBodyMut
 		require.NoError(t, err)
 		require.NotNil(t, response)
 
-		// Verify the body mutation was applied to the Bedrock-translated body
+		// ProcessRequestHeaders returns CONTINUE — body replacement is in ProcessRequestBody.
 		commonRes := response.Response.(*extprocv3.ProcessingResponse_RequestHeaders).RequestHeaders.Response
-		mutatedBody := commonRes.BodyMutation.GetBody()
+		require.Equal(t, extprocv3.CommonResponse_CONTINUE, commonRes.Status)
+
+		// Body replacement happens in ProcessRequestBody, using the translator's Bedrock body.
+		bodyResp, err := p.ProcessRequestBody(ctx, &extprocv3.HttpBody{Body: originalRequestBodyRaw})
+		require.NoError(t, err)
+		require.NotNil(t, bodyResp)
+		bodyRes := bodyResp.Response.(*extprocv3.ProcessingResponse_RequestBody).RequestBody.Response
+		require.Equal(t, extprocv3.CommonResponse_CONTINUE, bodyRes.Status)
+		mutatedBody := bodyRes.BodyMutation.GetBody()
 		require.NotNil(t, mutatedBody)
 
 		// Parse the mutated body
@@ -1631,7 +1769,14 @@ func TestChatCompletionProcessorUpstreamFilter_ProcessRequestHeaders_WithBodyMut
 		require.NotNil(t, response)
 
 		commonRes := response.Response.(*extprocv3.ProcessingResponse_RequestHeaders).RequestHeaders.Response
-		mutatedBody := commonRes.BodyMutation.GetBody()
+		require.Equal(t, extprocv3.CommonResponse_CONTINUE, commonRes.Status)
+
+		// Body replacement happens in ProcessRequestBody, using the translator's Bedrock body.
+		bodyResp, err := p.ProcessRequestBody(ctx, &extprocv3.HttpBody{Body: originalRequestBodyRaw})
+		require.NoError(t, err)
+		bodyRes := bodyResp.Response.(*extprocv3.ProcessingResponse_RequestBody).RequestBody.Response
+		require.Equal(t, extprocv3.CommonResponse_CONTINUE, bodyRes.Status)
+		mutatedBody := bodyRes.BodyMutation.GetBody()
 		require.NotNil(t, mutatedBody)
 
 		var result map[string]interface{}
@@ -1688,9 +1833,15 @@ func TestChatCompletionProcessorUpstreamFilter_ProcessRequestHeaders_WithBodyMut
 		require.NoError(t, err)
 		require.NotNil(t, retryResponse)
 
-		// Verify the body mutation was applied to the modified Bedrock body
 		retryCommonRes := retryResponse.Response.(*extprocv3.ProcessingResponse_RequestHeaders).RequestHeaders.Response
-		retryMutatedBody := retryCommonRes.BodyMutation.GetBody()
+		require.Equal(t, extprocv3.CommonResponse_CONTINUE, retryCommonRes.Status)
+
+		// Body replacement happens in ProcessRequestBody, using the retry translator's body.
+		retryBodyResp, err := p.ProcessRequestBody(ctx, &extprocv3.HttpBody{Body: modifiedBedrockBody})
+		require.NoError(t, err)
+		retryBodyRes := retryBodyResp.Response.(*extprocv3.ProcessingResponse_RequestBody).RequestBody.Response
+		require.Equal(t, extprocv3.CommonResponse_CONTINUE, retryBodyRes.Status)
+		retryMutatedBody := retryBodyRes.BodyMutation.GetBody()
 		require.NotNil(t, retryMutatedBody)
 
 		var retryResult map[string]interface{}
