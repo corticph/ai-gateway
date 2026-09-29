@@ -443,9 +443,11 @@ func (s *Server) maybeModifyCluster(ctx context.Context, cluster *clusterv3.Clus
 	}
 	extProcConfig.ProcessingMode = &extprocv3.ProcessingMode{
 		RequestHeaderMode: extprocv3.ProcessingMode_SEND,
-		// At the upstream filter, it can access the original body in its memory, so it can perform the translation
-		// as well as the authentication at the request headers. Hence, there's no need to send the request body to the extproc.
-		RequestBodyMode: extprocv3.ProcessingMode_NONE,
+		// The upstream filter needs the current request body (after any prior
+		// ext_proc filters have modified it) so that bodyMutation is applied to
+		// the up-to-date body rather than the stale originalRequestBodyRaw
+		// snapshot captured before prior filters ran.
+		RequestBodyMode: extprocv3.ProcessingMode_BUFFERED,
 		// Response will be handled at the router filter level so that we could avoid the shenanigans around the retry+the upstream filter.
 		ResponseHeaderMode: extprocv3.ProcessingMode_SKIP,
 		ResponseBodyMode:   extprocv3.ProcessingMode_NONE,

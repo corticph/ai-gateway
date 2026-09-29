@@ -117,13 +117,21 @@ type (
 		responseEncoding   string
 		compressedBuf      []byte // accumulates raw compressed bytes across streaming chunks
 		decompressedOffset int    // tracks decompressed bytes already returned
-		translator         translator.Translator[ReqT, tracingapi.Span[RespT, RespChunkT]]
-		modelNameOverride  internalapi.ModelNameOverride
-		headerMutator      *headermutator.HeaderMutator
-		bodyMutator        *bodymutator.BodyMutator
-		backendName        string
-		routeName          string
-		handler            filterapi.BackendAuthHandler
+	translator         translator.Translator[ReqT, tracingapi.Span[RespT, RespChunkT]]
+	modelNameOverride  internalapi.ModelNameOverride
+	headerMutator      *headermutator.HeaderMutator
+	bodyMutator        *bodymutator.BodyMutator
+	backendName        string
+	routeName          string
+	handler            filterapi.BackendAuthHandler
+	// pendingBodyReplace is set in ProcessRequestHeaders when the body needs
+	// replacement (translator body, forceBodyMutation, or bodyMutator has
+	// mutations). The actual replacement happens in ProcessRequestBody.
+	// pendingTranslatorBody holds the translator's body output (nil for
+	// passthrough translators). When non-nil, it is used as the base for
+	// bodyMutator; when nil, the current body from the filter chain is used.
+	pendingBodyReplace    bool
+	pendingTranslatorBody []byte
 		// cost is the cost of the request that is accumulated during the processing of the response.
 		costs metrics.TokenUsage
 		// metrics tracking.
@@ -380,10 +388,13 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 	mutatorHasMutations := u.bodyMutator != nil && u.bodyMutator.HasMutations()
 	wantBodyReplace := bodyMutation != nil || forceBodyMutation || mutatorHasMutations
 
-	if wantBodyReplace {
-		// Apply body mutations from the route and also restore original body on retry.
-		bodyMutation = applyBodyMutation(u.bodyMutator, bodyMutation, u.parent.originalRequestBodyRaw, u.logger)
-	}
+	// Store for ProcessRequestBody. When RequestBodyMode is BUFFERED, the
+	// body mutation (model override from translator + bodyMutator) is applied
+	// in ProcessRequestBody on the current body from the filter chain, not on
+	// the stale originalRequestBodyRaw captured before prior ext_proc filters
+	// ran.
+	u.pendingBodyReplace = wantBodyReplace
+	u.pendingTranslatorBody = newBody
 
 	// Ensure bodyMutation is not nil for subsequent processing
 	if bodyMutation == nil {
@@ -428,17 +439,32 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 		}, nil
 	}
 
+	// Body replacement is deferred to ProcessRequestBody, which receives the
+	// current body from the filter chain (post prior ext_proc). Emit CONTINUE
+	// with headers only; the body mutation rides on the ProcessRequestBody
+	// response. Set content-length dynamic metadata here so the downstream
+	// header_mutation filter can restamp it at header time.
 	var dm *structpb.Struct
-	if bm := bodyMutation.GetBody(); bm != nil {
-		dm = buildContentLengthDynamicMetadataOnRequest(len(bm))
+	if newBody != nil {
+		dm = buildContentLengthDynamicMetadataOnRequest(len(newBody))
+	} else if mutatorHasMutations {
+		// Passthrough translator with bodyMutator: compute the mutated body
+		// length on the originalRequestBodyRaw to set content-length metadata.
+		// The actual mutation in ProcessRequestBody uses the current body
+		// from the filter chain; the length is the same or close enough for
+		// content-length restamping.
+		previewsBody := u.parent.originalRequestBodyRaw
+		if mutated, mErr := u.bodyMutator.Mutate(previewsBody); mErr == nil {
+			dm = buildContentLengthDynamicMetadataOnRequest(len(mutated))
+		}
 	}
 	dm = mergeDynamicMetadata(dm, buildRequestHeaderDynamicMetadata(u.requestHeaders))
 	return &extprocv3.ProcessingResponse{
 		Response: &extprocv3.ProcessingResponse_RequestHeaders{
 			RequestHeaders: &extprocv3.HeadersResponse{
 				Response: &extprocv3.CommonResponse{
-					HeaderMutation: headerMutation, BodyMutation: bodyMutation,
-					Status: extprocv3.CommonResponse_CONTINUE_AND_REPLACE,
+					HeaderMutation: headerMutation,
+					Status:         extprocv3.CommonResponse_CONTINUE,
 				},
 			},
 		},
@@ -447,8 +473,76 @@ func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessReque
 }
 
 // ProcessRequestBody implements [Processor.ProcessRequestBody].
-func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessRequestBody(context.Context, *extprocv3.HttpBody) (res *extprocv3.ProcessingResponse, err error) {
-	panic("BUG: ProcessRequestBody should not be called in the upstream filter")
+//
+// When RequestBodyMode is BUFFERED, Envoy sends the full request body here
+// after all prior ext_proc filters have processed it. Body replacement that
+// was previously done in ProcessRequestHeaders now happens here:
+//
+//   - If the translator produced a body (e.g. format translation or model
+//     override), that body is used as the base.
+//   - If the translator returned no body (passthrough), the current body
+//     from the filter chain is used, preserving mutations done by earlier
+//     ext_proc filters.
+//
+// The bodyMutator from route config is then applied on the base body.
+func (u *upstreamProcessor[ReqT, RespT, RespChunkT, EndpointSpecT]) ProcessRequestBody(_ context.Context, body *extprocv3.HttpBody) (res *extprocv3.ProcessingResponse, err error) {
+	if !u.pendingBodyReplace {
+		return &extprocv3.ProcessingResponse{
+			Response: &extprocv3.ProcessingResponse_RequestBody{
+				RequestBody: &extprocv3.BodyResponse{
+					Response: &extprocv3.CommonResponse{
+						Status: extprocv3.CommonResponse_CONTINUE,
+					},
+				},
+			},
+		}, nil
+	}
+
+	// Prefer the translator's body output when available. For passthrough
+	// translators (nil body), use the current body from the filter chain so
+	// that mutations done by earlier ext_proc filters are preserved.
+	currentBody := u.pendingTranslatorBody
+	if currentBody == nil {
+		currentBody = body.GetBody()
+	}
+
+	// Apply bodyMutator from route config.
+	if u.bodyMutator != nil && u.bodyMutator.HasMutations() {
+		mutatedBody, mutationErr := u.bodyMutator.Mutate(currentBody)
+		if mutationErr != nil {
+			u.logger.Error("failed to apply body mutation on request body", "error", mutationErr)
+		} else {
+			currentBody = mutatedBody
+		}
+	}
+
+	bodyMutation := &extprocv3.BodyMutation{
+		Mutation: &extprocv3.BodyMutation_Body{Body: currentBody},
+	}
+
+	headerMutation := &extprocv3.HeaderMutation{
+		SetHeaders: []*corev3.HeaderValueOption{
+			{
+				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+				Header: &corev3.HeaderValue{
+					Key:      "content-length",
+					RawValue: []byte(strconv.Itoa(len(currentBody))),
+				},
+			},
+		},
+	}
+
+	return &extprocv3.ProcessingResponse{
+		Response: &extprocv3.ProcessingResponse_RequestBody{
+			RequestBody: &extprocv3.BodyResponse{
+				Response: &extprocv3.CommonResponse{
+					HeaderMutation: headerMutation,
+					BodyMutation:   bodyMutation,
+					Status:         extprocv3.CommonResponse_CONTINUE,
+				},
+			},
+		},
+	}, nil
 }
 
 // ProcessResponseHeaders implements [Processor.ProcessResponseHeaders].
