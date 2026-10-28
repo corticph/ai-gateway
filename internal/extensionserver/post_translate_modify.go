@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -105,16 +107,21 @@ func (s *Server) PostTranslateModify(ctx context.Context, req *egextension.PostT
 		extProcUDSExist = extProcUDSExist || cluster.Name == extProcUDSClusterName
 	}
 
+	// Deduplicate the InferencePool references across cluster and route metadata once, so
+	// that every reference to the same pool resolves to the same endpoint picker config
+	// whether it is used to build a cluster or a filter (PLA-7735).
+	inferencePools := collectInferencePools(s.log, req.Clusters, req.Routes)
+
 	// Add external processor clusters for InferencePool backends.
 	// These clusters connect to the endpoint picker services (EPP) specified in InferencePool resources.
-	cs, err := buildClustersForInferencePoolEndpointPickers(req.Clusters)
+	cs, err := buildClustersForInferencePoolEndpointPickers(inferencePools)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build clusters for InferencePool endpoint pickers: %w", err)
 	}
 	req.Clusters = append(req.Clusters, cs...)
 
 	// Modify listeners and routes to support InferencePool backends.
-	if err = s.maybeModifyListenerAndRoutes(req.Listeners, req.Routes); err != nil {
+	if err = s.maybeModifyListenerAndRoutes(req.Listeners, req.Routes, inferencePools); err != nil {
 		return nil, fmt.Errorf("failed to modify listeners and routes for InferencePool support: %w", err)
 	}
 
@@ -531,7 +538,7 @@ func (s *Server) maybeModifyCluster(ctx context.Context, cluster *clusterv3.Clus
 // 2. Adds endpoint picker (EPP) external processor filters to relevant listeners
 // 3. Configures per-route filters to disable EPP processing for non-InferencePool routes
 // This ensures that only routes targeting InferencePool backends go through the endpoint picker.
-func (s *Server) maybeModifyListenerAndRoutes(listeners []*listenerv3.Listener, routes []*routev3.RouteConfiguration) error {
+func (s *Server) maybeModifyListenerAndRoutes(listeners []*listenerv3.Listener, routes []*routev3.RouteConfiguration, inferencePools map[string]*gwaiev1.InferencePool) error {
 	listenerNameToRouteNames := make(map[string][]string)
 	listenerNameToListener := make(map[string]*listenerv3.Listener)
 	for _, listener := range listeners {
@@ -549,54 +556,64 @@ func (s *Server) maybeModifyListenerAndRoutes(listeners []*listenerv3.Listener, 
 		listenerNameToListener[listener.Name] = listener
 	}
 
-	// inferencePoolRoutes builds a matrix of route configs and the inference pools they use.
+	// routeCfgNameToPoolKeys collects the filter-name keys of the pools each route config
+	// references, as a set: route names are only unique within a virtual host, so a
+	// per-route map would silently drop pools when names repeat across virtual hosts.
 	routeNameToRoute := make(map[string]*routev3.RouteConfiguration)
-	routeNameToVHRouteNameToInferencePool := make(map[string]map[string]*gwaiev1.InferencePool)
+	routeCfgNameToPoolKeys := make(map[string]map[string]bool)
 	for _, routeCfg := range routes {
 		routeNameToRoute[routeCfg.Name] = routeCfg
 		for _, vh := range routeCfg.VirtualHosts {
 			for _, route := range vh.Routes {
 				if pool := getInferencePoolByMetadata(route.Metadata); pool != nil {
-					if routeNameToVHRouteNameToInferencePool[routeCfg.Name] == nil {
-						routeNameToVHRouteNameToInferencePool[routeCfg.Name] = make(map[string]*gwaiev1.InferencePool)
+					if routeCfgNameToPoolKeys[routeCfg.Name] == nil {
+						routeCfgNameToPoolKeys[routeCfg.Name] = make(map[string]bool)
 					}
-					routeNameToVHRouteNameToInferencePool[routeCfg.Name][route.Name] = pool
+					routeCfgNameToPoolKeys[routeCfg.Name][httpFilterNameForInferencePool(pool)] = true
 				}
 			}
 		}
 	}
 
-	// listenerToInferencePools builds a matrix of listeners and the inference pools they use.
+	// Collect the pools each listener uses from the canonical pool map, sorted by filter
+	// name so the emitted filters are identical across reconciles. Listeners without
+	// InferencePool routes are not patched at all, so their configuration is not
+	// re-serialized on every reconcile (PLA-7735).
 	listenerToInferencePools := make(map[string][]*gwaiev1.InferencePool)
 	for listener, routeCfgNames := range listenerNameToRouteNames {
+		poolKeys := make(map[string]bool)
 		for _, name := range routeCfgNames {
-			if routeNameToRoute[name] == nil {
+			if routeNameToRoute[name] == nil || routeCfgNameToPoolKeys[name] == nil {
 				continue
 			}
-			if routeNameToVHRouteNameToInferencePool[name] == nil {
-				continue
-			}
-			for _, pool := range routeNameToVHRouteNameToInferencePool[name] {
-				if listenerToInferencePools[listener] == nil {
-					listenerToInferencePools[listener] = make([]*gwaiev1.InferencePool, 0)
-				}
-				listenerToInferencePools[listener] = append(listenerToInferencePools[listener], pool)
+			for key := range routeCfgNameToPoolKeys[name] {
+				poolKeys[key] = true
 			}
 		}
+		if len(poolKeys) == 0 {
+			continue
+		}
+		pools := make([]*gwaiev1.InferencePool, 0, len(poolKeys))
+		for _, key := range slices.Sorted(maps.Keys(poolKeys)) {
+			pool, ok := inferencePools[key]
+			if !ok {
+				return fmt.Errorf("inference pool %q referenced by a route has no canonical reference", key)
+			}
+			pools = append(pools, pool)
+		}
+		listenerToInferencePools[listener] = pools
 	}
 
-	// patch the listeners, the route configs and the virtual hosts with inference pool filters.
+	// Patch the listeners, the route configs and the virtual hosts with the inference pool filters.
 	for listener, pools := range listenerToInferencePools {
-		s.log.Info("patching listener with inference pool filters", "listener", listener)
+		s.log.Info("patching listener with inference pool filters", "listener", listener, "pools", len(pools))
 		s.patchListenerWithInferencePoolFilters(listenerNameToListener[listener], pools)
-		routeCfgNames := listenerNameToRouteNames[listener]
-		for _, routeCfgName := range routeCfgNames {
+		for _, routeCfgName := range listenerNameToRouteNames[listener] {
 			routeCfg := routeNameToRoute[routeCfgName]
 			if routeCfg == nil {
 				continue
 			}
 			for _, vh := range routeCfg.VirtualHosts {
-				s.log.Info("patching virtual host with inference pool filters", "listener", listener, "virtual_host", vh.Name)
 				if err := s.patchVirtualHostWithInferencePool(vh, pools); err != nil {
 					return fmt.Errorf("failed to patch virtual host %s in route config %s: %w", vh.Name, routeCfg.Name, err)
 				}
@@ -661,13 +678,14 @@ func (s *Server) patchListenerWithInferencePoolFilters(listener *listenerv3.List
 				poolFilters = append(poolFilters, eppExtProc)
 			}
 		}
-		if len(poolFilters) != 0 {
-			length := len(httpConManager.HttpFilters)
-			router := httpConManager.HttpFilters[length-1]
-			httpConManager.HttpFilters = httpConManager.HttpFilters[:length-1]
-			httpConManager.HttpFilters = append(httpConManager.HttpFilters, poolFilters...)
-			httpConManager.HttpFilters = append(httpConManager.HttpFilters, router)
+		if len(poolFilters) == 0 {
+			continue // Nothing to add; do not re-serialize an unchanged chain.
 		}
+		length := len(httpConManager.HttpFilters)
+		router := httpConManager.HttpFilters[length-1]
+		httpConManager.HttpFilters = httpConManager.HttpFilters[:length-1]
+		httpConManager.HttpFilters = append(httpConManager.HttpFilters, poolFilters...)
+		httpConManager.HttpFilters = append(httpConManager.HttpFilters, router)
 
 		// Write the updated HCM back to the filter chain.
 		hcmAny, err := toAny(httpConManager)
@@ -685,16 +703,16 @@ func (s *Server) patchVirtualHostWithInferencePool(vh *routev3.VirtualHost, infe
 	for _, pool := range inferencePools {
 		inferenceMatrix[httpFilterNameForInferencePool(pool)] = pool
 	}
+	// The disable override is identical for every route and filter; build it once.
+	overrideAny, err := toAny(&extprocv3.ExtProcPerRoute{
+		Override: &extprocv3.ExtProcPerRoute_Disabled{
+			Disabled: true,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal ExtProcPerRoute to Any: %w", err)
+	}
 	for _, route := range vh.Routes {
-		override := &extprocv3.ExtProcPerRoute{
-			Override: &extprocv3.ExtProcPerRoute_Disabled{
-				Disabled: true,
-			},
-		}
-		overrideAny, err := toAny(override)
-		if err != nil {
-			return fmt.Errorf("failed to marshal ExtProcPerRoute to Any: %w", err)
-		}
 		inferencePool := getInferencePoolByMetadata(route.Metadata)
 		if inferencePool == nil {
 			for key, pool := range inferenceMatrix {
@@ -764,15 +782,19 @@ func (s *Server) insertRouterLevelAIGatewayExtProc(listener *listenerv3.Listener
 	if defaultFC != nil {
 		filterChains = append(filterChains, defaultFC)
 	}
-	// Go over all of the chains, and add the endpoint picker external processor filters.
+	// Go over all of the chains, and add the AI Gateway extproc filter to those that need it.
+	// Listeners can mix HTTP and non-HTTP chains (e.g. TCP proxies); skip the latter
+	// instead of failing the whole translation.
 	for _, currChain := range filterChains {
 		httpConManager, hcmIndex, err := findHCM(currChain)
 		if err != nil {
-			return fmt.Errorf("failed to find HCM in filter chain: %w", err)
+			s.log.Info("skipping non-HTTP filter chain", "listener", listener.Name, "chain", currChain.Name)
+			continue
 		}
-		// Check if the extproc filter is already present.
+		// Check if the extproc filter is already present in this chain; other chains may
+		// still need it, so continue instead of stopping.
 		if !shouldAIGatewayExtProcBeInserted(httpConManager.HttpFilters) {
-			return nil // The filter is already present, nothing to do.
+			continue
 		}
 		epAny, err := toAny(&extprocv3.ExternalProcessor{
 			GrpcService: &corev3.GrpcService{
@@ -811,7 +833,9 @@ func (s *Server) insertRouterLevelAIGatewayExtProc(listener *listenerv3.Listener
 
 		// Insert the AI Gateway extproc filter as the first extproc filter.
 		if err = insertAIGatewayExtProcFilter(httpConManager, extProcFilter); err != nil {
-			return fmt.Errorf("failed to insert AI Gateway extproc filter: %w", err)
+			s.log.Error(err, "failed to insert AI Gateway extproc filter, skipping chain",
+				"listener", listener.Name, "chain", currChain.Name)
+			continue
 		}
 		// Match the :scheme pseudo-header to the upstream transport protocol.
 		httpConManager.SchemeHeaderTransformation = &corev3.SchemeHeaderTransformation{
@@ -1074,8 +1098,17 @@ var afterExtProcFilterPrefixes = []string{
 }
 
 // findListenerRouteConfigs extracts route configuration names from the listener's filter chains.
+// All chains of a listener usually reference the same route config, so the names are deduplicated.
 func findListenerRouteConfigs(listener *listenerv3.Listener) []string {
 	var names []string
+	seen := make(map[string]bool)
+	addName := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
 	// First, get the filter chains from the listener.
 	for _, filterChain := range listener.FilterChains {
 		httpConManager, _, err := findHCM(filterChain)
@@ -1086,9 +1119,7 @@ func findListenerRouteConfigs(listener *listenerv3.Listener) []string {
 		if rds == nil {
 			continue // Skip if no route discovery service is configured.
 		}
-		if rds.RouteConfigName != "" {
-			names = append(names, rds.RouteConfigName)
-		}
+		addName(rds.RouteConfigName)
 	}
 	httpConManager, _, err := findHCM(listener.DefaultFilterChain)
 	if err != nil {
@@ -1098,5 +1129,6 @@ func findListenerRouteConfigs(listener *listenerv3.Listener) []string {
 	if rds == nil {
 		return names // Return names collected so far, even if no RDS in default filter chain.
 	}
-	return append(names, rds.RouteConfigName) // Add default filter chain's route config name.
+	addName(rds.RouteConfigName)
+	return names
 }

@@ -114,9 +114,11 @@ func (s *Server) List(context.Context, *grpc_health_v1.HealthListRequest) (*grpc
 	}}, nil
 }
 
-// toAny marshals the provided message to an Any message.
+// toAny marshals the provided message to an Any message. Marshaling is deterministic so
+// that repeated reconciles of unchanged configuration produce byte-identical output; the
+// default marshaling randomizes map field order.
 func toAny(msg proto.Message) (*anypb.Any, error) {
-	b, err := proto.Marshal(msg)
+	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(msg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal message to Any: %w", err)
 	}

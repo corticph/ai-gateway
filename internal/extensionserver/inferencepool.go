@@ -7,6 +7,8 @@ package extensionserver
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +24,7 @@ import (
 	tlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	upstreamsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
+	"github.com/go-logr/logr"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -183,18 +186,66 @@ func buildEPPMetadata(metadata *corev3.Metadata, inferencePool *gwaiev1.Inferenc
 	)
 }
 
-// buildClustersForInferencePoolEndpointPickers builds and returns a "STRICT_DNS" cluster
-// for each InferencePool's endpoint picker service.
-func buildClustersForInferencePoolEndpointPickers(clusters []*clusterv3.Cluster) ([]*clusterv3.Cluster, error) {
-	result := make([]*clusterv3.Cluster, 0, len(clusters))
+// collectInferencePools returns the InferencePool references from all cluster and route
+// metadata, deduplicated by resource name, so every reference to the same pool resolves
+// to the same endpoint picker config, whether used for a cluster or a filter (PLA-7735).
+func collectInferencePools(log logr.Logger, clusters []*clusterv3.Cluster, routes []*routev3.RouteConfiguration) map[string]*gwaiev1.InferencePool {
+	pools := make(map[string]*gwaiev1.InferencePool)
 	for _, cluster := range clusters {
 		if pool := getInferencePoolByMetadata(cluster.Metadata); pool != nil {
-			c, err := buildExtProcClusterForInferencePoolEndpointPicker(pool)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, c)
+			addPoolDeduped(log, pools, pool)
 		}
+	}
+	for _, rc := range routes {
+		for _, vh := range rc.VirtualHosts {
+			for _, route := range vh.Routes {
+				if pool := getInferencePoolByMetadata(route.Metadata); pool != nil {
+					addPoolDeduped(log, pools, pool)
+				}
+			}
+		}
+	}
+	return pools
+}
+
+// addPoolDeduped records the first reference to each pool in the pools map. Clusters and
+// routes are iterated in list order, so the first reference wins deterministically and
+// the EPP clusters and the listener filters all use the same pool. A later conflicting
+// reference is dropped with a log line.
+func addPoolDeduped(log logr.Logger, pools map[string]*gwaiev1.InferencePool, pool *gwaiev1.InferencePool) {
+	key := httpFilterNameForInferencePool(pool)
+	existing, ok := pools[key]
+	if !ok {
+		pools[key] = pool
+		return
+	}
+	if ref, existingRef := poolReference(pool), poolReference(existing); ref != existingRef {
+		log.Error(nil, "conflicting references to the same inference pool, using the first one",
+			"pool", key, "kept", existingRef, "dropped", ref)
+	}
+}
+
+// poolReference returns the canonical metadata encoding of the pool reference, used to
+// detect conflicting references in addPoolDeduped.
+func poolReference(pool *gwaiev1.InferencePool) string {
+	return clusterRefInferencePool(pool.GetNamespace(), pool.GetName(),
+		string(pool.Spec.EndpointPickerRef.Name), portForInferencePool(pool),
+		getProcessingBodyModeStringFromAnnotations(pool),
+		getAllowModeOverrideStringFromAnnotations(pool))
+}
+
+// buildClustersForInferencePoolEndpointPickers builds a "STRICT_DNS" cluster per given
+// InferencePool, sorted by resource name so repeated reconciles produce identical output.
+// The map is keyed by HTTP filter name; the cluster names carry the same pool name and
+// namespace, so both orders coincide.
+func buildClustersForInferencePoolEndpointPickers(inferencePools map[string]*gwaiev1.InferencePool) ([]*clusterv3.Cluster, error) {
+	result := make([]*clusterv3.Cluster, 0, len(inferencePools))
+	for _, key := range slices.Sorted(maps.Keys(inferencePools)) {
+		c, err := buildExtProcClusterForInferencePoolEndpointPicker(inferencePools[key])
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, c)
 	}
 	return result, nil
 }

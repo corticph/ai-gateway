@@ -265,7 +265,7 @@ func (s *Server) buildQuotaRateLimitFilter(domain string) (*httpconnectionmanage
 		RateLimitedAsResourceExhausted: false,
 	}
 
-	cfgAny, err := anypb.New(rateLimitCfg)
+	cfgAny, err := toAny(rateLimitCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal rate limit filter config: %w", err)
 	}
@@ -638,7 +638,7 @@ func enableQuotaRateLimitOnRoute(_ logr.Logger, route *routev3.Route, policies [
 		RateLimits: rateLimitActions,
 	}
 
-	perRouteAny, err := anypb.New(perRouteConfig)
+	perRouteAny, err := toAny(perRouteConfig)
 	if err != nil {
 		return fmt.Errorf("failed to marshal RateLimitPerRoute: %w", err)
 	}
