@@ -184,17 +184,22 @@ func buildEPPMetadata(metadata *corev3.Metadata, inferencePool *gwaiev1.Inferenc
 }
 
 // buildClustersForInferencePoolEndpointPickers builds and returns a "STRICT_DNS" cluster
-// for each InferencePool's endpoint picker service.
+// for each InferencePool's endpoint picker service. Several clusters can reference the
+// same pool (one per route rule), but each pool gets only one endpoint picker cluster.
 func buildClustersForInferencePoolEndpointPickers(clusters []*clusterv3.Cluster) ([]*clusterv3.Cluster, error) {
 	result := make([]*clusterv3.Cluster, 0, len(clusters))
+	seen := make(map[string]bool)
 	for _, cluster := range clusters {
-		if pool := getInferencePoolByMetadata(cluster.Metadata); pool != nil {
-			c, err := buildExtProcClusterForInferencePoolEndpointPicker(pool)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, c)
+		pool := getInferencePoolByMetadata(cluster.Metadata)
+		if pool == nil || seen[clusterNameForInferencePool(pool)] {
+			continue
 		}
+		seen[clusterNameForInferencePool(pool)] = true
+		c, err := buildExtProcClusterForInferencePoolEndpointPicker(pool)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, c)
 	}
 	return result, nil
 }

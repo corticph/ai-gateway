@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -549,40 +550,42 @@ func (s *Server) maybeModifyListenerAndRoutes(listeners []*listenerv3.Listener, 
 		listenerNameToListener[listener.Name] = listener
 	}
 
-	// inferencePoolRoutes builds a matrix of route configs and the inference pools they use.
+	// routeCfgNameToInferencePools lists the inference pools referenced by each route config's routes.
 	routeNameToRoute := make(map[string]*routev3.RouteConfiguration)
-	routeNameToVHRouteNameToInferencePool := make(map[string]map[string]*gwaiev1.InferencePool)
+	routeCfgNameToInferencePools := make(map[string][]*gwaiev1.InferencePool)
 	for _, routeCfg := range routes {
 		routeNameToRoute[routeCfg.Name] = routeCfg
 		for _, vh := range routeCfg.VirtualHosts {
 			for _, route := range vh.Routes {
 				if pool := getInferencePoolByMetadata(route.Metadata); pool != nil {
-					if routeNameToVHRouteNameToInferencePool[routeCfg.Name] == nil {
-						routeNameToVHRouteNameToInferencePool[routeCfg.Name] = make(map[string]*gwaiev1.InferencePool)
-					}
-					routeNameToVHRouteNameToInferencePool[routeCfg.Name][route.Name] = pool
+					routeCfgNameToInferencePools[routeCfg.Name] = append(routeCfgNameToInferencePools[routeCfg.Name], pool)
 				}
 			}
 		}
 	}
 
-	// listenerToInferencePools builds a matrix of listeners and the inference pools they use.
+	// listenerToInferencePools lists the inference pools each listener uses, once per pool and
+	// sorted by filter name. The result must not depend on route order: Envoy drains all filter
+	// chains of a listener whenever its config changes, cutting every open connection.
 	listenerToInferencePools := make(map[string][]*gwaiev1.InferencePool)
 	for listener, routeCfgNames := range listenerNameToRouteNames {
+		var pools []*gwaiev1.InferencePool
+		seen := make(map[string]bool)
 		for _, name := range routeCfgNames {
-			if routeNameToRoute[name] == nil {
-				continue
-			}
-			if routeNameToVHRouteNameToInferencePool[name] == nil {
-				continue
-			}
-			for _, pool := range routeNameToVHRouteNameToInferencePool[name] {
-				if listenerToInferencePools[listener] == nil {
-					listenerToInferencePools[listener] = make([]*gwaiev1.InferencePool, 0)
+			for _, pool := range routeCfgNameToInferencePools[name] {
+				if key := httpFilterNameForInferencePool(pool); !seen[key] {
+					seen[key] = true
+					pools = append(pools, pool)
 				}
-				listenerToInferencePools[listener] = append(listenerToInferencePools[listener], pool)
 			}
 		}
+		if len(pools) == 0 {
+			continue
+		}
+		slices.SortFunc(pools, func(a, b *gwaiev1.InferencePool) int {
+			return strings.Compare(httpFilterNameForInferencePool(a), httpFilterNameForInferencePool(b))
+		})
+		listenerToInferencePools[listener] = pools
 	}
 
 	// patch the listeners, the route configs and the virtual hosts with inference pool filters.

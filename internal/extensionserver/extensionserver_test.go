@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"testing"
 	"time"
 
@@ -992,6 +993,60 @@ func TestMaybeModifyListenerAndRoutes(t *testing.T) {
 		err := s.maybeModifyListenerAndRoutes(listeners, routes)
 		require.NoError(t, err)
 		// Should handle gracefully when referenced route config is not found.
+	})
+
+	// Any change to a listener makes Envoy drain its filter chains, so the inference pool
+	// filters must come out identical regardless of the order in which routes are seen.
+	t.Run("inference pool filters are one per pool and independent of route order", func(t *testing.T) {
+		poolRoute := func(routeName, poolName string) *routev3.Route {
+			return &routev3.Route{
+				Name: routeName,
+				Metadata: &corev3.Metadata{
+					FilterMetadata: map[string]*structpb.Struct{
+						internalapi.InternalEndpointMetadataNamespace: {
+							Fields: map[string]*structpb.Value{
+								"per_route_rule_inference_pool": structpb.NewStringValue("ns/" + poolName + "/" + poolName + "-epp/9002/duplex/false"),
+							},
+						},
+					},
+				},
+			}
+		}
+		// Each pool is referenced by two routes, like the two rules of an AIGatewayRoute.
+		buildRoutes := func(reversed bool) []*routev3.RouteConfiguration {
+			var rs []*routev3.Route
+			for _, pool := range []string{"pool-c", "pool-a", "pool-b"} {
+				rs = append(rs, poolRoute(pool+"/rule/0", pool), poolRoute(pool+"/rule/1", pool))
+			}
+			if reversed {
+				slices.Reverse(rs)
+			}
+			return []*routev3.RouteConfiguration{{
+				Name:         "rc",
+				VirtualHosts: []*routev3.VirtualHost{{Name: "vh", Routes: rs}},
+			}}
+		}
+		run := func(reversed bool) *listenerv3.Listener {
+			listener := createListener("listener", "rc")
+			require.NoError(t, s.maybeModifyListenerAndRoutes([]*listenerv3.Listener{listener}, buildRoutes(reversed)))
+			return listener
+		}
+
+		inOrder, reversed := run(false), run(true)
+		require.True(t, proto.Equal(inOrder, reversed), "listener must not depend on route order")
+
+		hcm, _, err := findHCM(inOrder.DefaultFilterChain)
+		require.NoError(t, err)
+		var names []string
+		for _, f := range hcm.HttpFilters {
+			names = append(names, f.Name)
+		}
+		require.Equal(t, []string{
+			"envoy.filters.http.ext_proc/endpointpicker/pool-a_ns_ext_proc",
+			"envoy.filters.http.ext_proc/endpointpicker/pool-b_ns_ext_proc",
+			"envoy.filters.http.ext_proc/endpointpicker/pool-c_ns_ext_proc",
+			"envoy.filters.http.router",
+		}, names)
 	})
 }
 
@@ -2195,6 +2250,18 @@ func TestBuildClustersForInferencePoolEndpointPickers(t *testing.T) {
 		result, err := buildClustersForInferencePoolEndpointPickers(clusters)
 		require.NoError(t, err)
 		require.Empty(t, result)
+	})
+
+	t.Run("one cluster per pool", func(t *testing.T) {
+		otherPool := proto.Clone(cluster).(*clusterv3.Cluster)
+		fields := otherPool.Metadata.FilterMetadata[internalapi.InternalEndpointMetadataNamespace].Fields
+		fields["per_route_rule_inference_pool"] = structpb.NewStringValue("test-ns/other-pool/other-epp/9002/duplex/false")
+		clusters := []*clusterv3.Cluster{cluster, otherPool, proto.Clone(cluster).(*clusterv3.Cluster)}
+		result, err := buildClustersForInferencePoolEndpointPickers(clusters)
+		require.NoError(t, err)
+		require.Len(t, result, 2)
+		require.Equal(t, "envoy.clusters.endpointpicker_test-pool_test-ns_ext_proc", result[0].Name)
+		require.Equal(t, "envoy.clusters.endpointpicker_other-pool_test-ns_ext_proc", result[1].Name)
 	})
 }
 
