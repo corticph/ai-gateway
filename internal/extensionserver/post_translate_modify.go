@@ -511,8 +511,8 @@ func (s *Server) maybeModifyCluster(ctx context.Context, cluster *clusterv3.Clus
 		RequestBodyMode:    extprocv3.ProcessingMode_BUFFERED,
 		RequestTrailerMode: extprocv3.ProcessingMode_SKIP,
 		// Response will be handled at the router filter level so that we could avoid the shenanigans around the retry+the upstream filter.
-		ResponseHeaderMode:  extprocv3.ProcessingMode_SKIP,
-		ResponseBodyMode:    extprocv3.ProcessingMode_NONE,
+		ResponseHeaderMode: extprocv3.ProcessingMode_SKIP,
+		ResponseBodyMode:   extprocv3.ProcessingMode_NONE,
 	}
 	extProcConfig.MessageTimeout = durationpb.New(10 * time.Second)
 	extProcConfig.GrpcService = &corev3.GrpcService{
